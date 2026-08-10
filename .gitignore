@@ -3,3 +3,6 @@
 /cover/
 /doc/
 erl_crash.dump
+/priv/plts/*.plt
+/priv/plts/*.plt.hash
+/safe_expression-*.tar

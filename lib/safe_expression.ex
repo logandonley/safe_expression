@@ -1,47 +1,77 @@
 defmodule SafeExpression do
   @moduledoc """
-  A constrained, safe expression language for comparisons, boolean logic, and
-  dotted field access over caller-supplied bindings — with no arbitrary code.
+  `SafeExpression` evaluates a small expression language against values in an
+  Elixir map. Use it for configurable rules, filters, and routing decisions that
+  need comparisons and boolean logic but must not execute Elixir code.
 
-  Deliberately **not** `Code.eval_*`/`string_to_quoted`: a hand-written
-  tokenizer → recursive-descent parser → tree-walking evaluator, so the only
-  things that can ever happen are field lookups, comparisons, and boolean logic —
-  there is no path to call a function, spawn, or touch the world.
+  The module uses a hand-written tokenizer, recursive-descent parser, and
+  tree-walking evaluator. Expressions cannot call functions, spawn processes, or
+  otherwise perform effects.
 
-  `eval/2` is total over valid argument types: a malformed expression, an unknown
-  operator, or a type mismatch (ordering non-numbers, boolean logic on a
-  non-boolean) returns `{:error, reason}` rather than raising. The grammar, by
-  precedence (loosest first):
+  The grammar, from lowest to highest precedence, is:
 
-      expr   := or
-      or     := and  ("||" and)*
-      and    := eq   ("&&" eq)*
-      eq     := rel  (("==" | "!=") rel)*
-      rel    := unary (("<" | ">" | "<=" | ">=") unary)*
-      unary  := "!" unary | primary
-      primary:= number | string | "true" | "false" | "null"
-              | path | "(" expr ")"
-      path   := ident ("." ident)*   # a dotted lookup into the bindings map
+      expr    := or
+      or      := and ("||" and)*
+      and     := eq ("&&" eq)*
+      eq      := rel (("==" | "!=") rel)*
+      rel     := unary (("<" | ">" | "<=" | ">=") unary)*
+      unary   := "!" unary | primary
+      primary := number | string | "true" | "false" | "null" | "nil"
+               | path | "(" expr ")"
+      path    := ident ("." ident)*
 
-  Field access reads the string-keyed `bindings` map. A missing path resolves to
-  `nil`, so `x == null` tests presence.
+  Paths read string keys only. Bindings can contain any Elixir term. A bare path
+  returns that term unchanged. A missing segment, a non-map intermediate value,
+  and an explicitly stored `nil` all resolve to `nil`. The language does not
+  distinguish among these cases. `nil` is an alias for the `null` literal.
 
-  Two deliberate limits, since this is a predicate language and not arithmetic:
-  number literals are non-negative (a negative value reaches an expression
-  through its bindings, never as a literal), and a string literal is taken
-  verbatim — a backslash escapes the next character (so `"\""` is a quote) but
-  there are no `\n`-style sequences, since expressions compare against
-  already-decoded values.
+  Equality uses Elixir's `==` and `!=` semantics, including equality between
+  numerically equivalent integers and floats. Ordering accepts numbers only.
+  `!`, `&&`, and `||` accept booleans only. The evaluator does not coerce values.
+
+  Number literals are non-negative. A backslash in a string literal escapes the
+  next character verbatim; sequences such as `\\n` do not produce a newline.
+
+  Expressions cannot execute arbitrary code. Evaluation does not limit CPU time
+  or memory use. Applications that accept untrusted expressions should limit the
+  length of `source` before they call `eval/2`.
   """
 
-  @type value :: number() | binary() | boolean() | nil | map() | list()
+  @type value :: term()
+  @type ordering_operator :: :lt | :gt | :lte | :gte
+  @type reason ::
+          :invalid_utf8
+          | :unterminated_string
+          | :unexpected_end
+          | :missing_closing_parenthesis
+          | :trailing_dot
+          | :unexpected_token
+          | {:unexpected_character, binary()}
+          | {:invalid_number, binary()}
+          | {:not_boolean, term()}
+          | {:not_comparable, ordering_operator(), term(), term()}
 
   @doc """
-  Evaluates `source` against the `bindings` map. Returns `{:ok, value}` with the
-  result's native type, or `{:error, reason}` for a malformed expression or a
-  type mismatch.
+  Evaluates `source` against `bindings`. Paths read string keys only.
+
+  Returns `{:ok, value}` with the result's native type, or `{:error, reason}` for
+  malformed input or an operator type mismatch.
+
+  ## Examples
+
+      iex> SafeExpression.eval(~s(count >= 2 && kind == "webhook"), %{
+      ...>   "count" => 3,
+      ...>   "kind" => "webhook"
+      ...> })
+      {:ok, true}
+
+      iex> SafeExpression.eval("payload", %{"payload" => {:queued, 42}})
+      {:ok, {:queued, 42}}
+
+      iex> SafeExpression.eval("value", %{value: 42})
+      {:ok, nil}
   """
-  @spec eval(String.t(), map()) :: {:ok, value()} | {:error, term()}
+  @spec eval(String.t(), map()) :: {:ok, value()} | {:error, reason()}
   def eval(source, bindings) when is_binary(source) and is_map(bindings) do
     with {:ok, tokens} <- tokenize(source),
          {:ok, ast} <- parse(tokens) do
@@ -51,7 +81,7 @@ defmodule SafeExpression do
 
   ## Tokenizer
 
-  # Two-character operators are matched before their single-character prefixes.
+  # The scanner matches two-character operators before their single-character prefixes.
   @two_char %{"==" => :eq, "!=" => :neq, "<=" => :lte, ">=" => :gte, "&&" => :and, "||" => :or}
   @one_char %{
     "<" => :lt,
@@ -74,9 +104,11 @@ defmodule SafeExpression do
       quote?(c) -> scan_string(source, acc)
       digit?(c) -> scan_number(source, acc)
       ident_start?(c) -> scan_ident(source, acc)
-      true -> {:error, {:unexpected_char, <<c::utf8>>}}
+      true -> {:error, {:unexpected_character, <<c::utf8>>}}
     end
   end
+
+  defp scan(<<_::binary>>, _acc), do: {:error, :invalid_utf8}
 
   defp match_two(<<a::utf8, b::utf8, _::binary>>) do
     case Map.fetch(@two_char, <<a::utf8, b::utf8>>) do
@@ -100,12 +132,14 @@ defmodule SafeExpression do
   defp scan_string(<<c::utf8, rest::binary>>, q, buf, acc),
     do: scan_string(rest, q, buf <> <<c::utf8>>, acc)
 
+  defp scan_string(<<_::binary>>, _q, _buf, _acc), do: {:error, :invalid_utf8}
+
   defp scan_number(source, acc) do
     {digits, rest} = take_while(source, &number_char?/1)
 
     case parse_number(digits) do
       {:ok, n} -> scan(rest, [{:number, n} | acc])
-      :error -> {:error, {:bad_number, digits}}
+      :error -> {:error, {:invalid_number, digits}}
     end
   end
 
@@ -144,15 +178,17 @@ defmodule SafeExpression do
 
   defp take_while("", _pred, buf), do: {buf, ""}
 
+  defp take_while(source, _pred, buf), do: {buf, source}
+
   defp drop(source, 0), do: source
   defp drop(<<_::utf8, rest::binary>>, n), do: drop(rest, n - 1)
 
-  ## Parser — recursive descent, loosest precedence first.
+  ## Parser
 
   defp parse(tokens) do
     case parse_or(tokens) do
       {:ok, ast, []} -> {:ok, ast}
-      {:ok, _ast, leftover} -> {:error, {:unexpected_tokens, leftover}}
+      {:ok, _ast, _leftover} -> {:error, :unexpected_token}
       {:error, _} = err -> err
     end
   end
@@ -162,7 +198,7 @@ defmodule SafeExpression do
   defp parse_eq(tokens), do: parse_binary(tokens, [:eq, :neq], &parse_rel/1)
   defp parse_rel(tokens), do: parse_binary(tokens, [:lt, :gt, :lte, :gte], &parse_unary/1)
 
-  # Left-associative chains of same-precedence operators.
+  # Binary operators with the same precedence associate to the left.
   defp parse_binary(tokens, ops, next) do
     with {:ok, left, rest} <- next.(tokens) do
       fold_binary(left, rest, ops, next)
@@ -201,13 +237,13 @@ defmodule SafeExpression do
     with {:ok, inner, rest} <- parse_or(rest) do
       case rest do
         [{:rparen} | rest] -> {:ok, inner, rest}
-        _ -> {:error, :missing_close_paren}
+        _ -> {:error, :missing_closing_parenthesis}
       end
     end
   end
 
   defp parse_primary([]), do: {:error, :unexpected_end}
-  defp parse_primary([token | _]), do: {:error, {:unexpected_token, token}}
+  defp parse_primary([_token | _]), do: {:error, :unexpected_token}
 
   defp parse_path(segments, [{:dot}, {:ident, name} | rest]),
     do: parse_path([name | segments], rest)
@@ -215,7 +251,7 @@ defmodule SafeExpression do
   defp parse_path(_segments, [{:dot} | _]), do: {:error, :trailing_dot}
   defp parse_path(segments, rest), do: {:ok, {:path, Enum.reverse(segments)}, rest}
 
-  ## Evaluator — a tree walk; the only effects are reads from `bindings`.
+  ## Evaluator
 
   defp evaluate({:lit, value}, _bindings), do: {:ok, value}
 

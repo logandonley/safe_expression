@@ -1,169 +1,270 @@
 defmodule SafeExpressionTest do
-  @moduledoc """
-  Contract tests for the constrained, safe expression language: comparisons,
-  boolean logic, and dotted field access over a bindings map, with no arbitrary
-  code.
-  """
   use ExUnit.Case, async: true
+  use ExUnitProperties
+
+  doctest SafeExpression
 
   alias SafeExpression, as: Expression
 
-  describe "comparisons over bindings" do
-    test "a numeric comparison resolves an identifier from the bindings" do
-      assert Expression.eval("count > 5", %{"count" => 10}) == {:ok, true}
+  describe "values and bindings" do
+    test "a bare path returns caller-provided terms unchanged" do
+      values = [
+        {:queued, 42},
+        %{nested: :value},
+        [:a, :list],
+        :an_atom,
+        fn -> :result end
+      ]
+
+      for value <- values do
+        assert Expression.eval("value", %{"value" => value}) == {:ok, value}
+      end
     end
 
-    test "each ordering operator compares numbers" do
-      assert Expression.eval("n < 5", %{"n" => 3}) == {:ok, true}
-      assert Expression.eval("n <= 3", %{"n" => 3}) == {:ok, true}
-      assert Expression.eval("n >= 4", %{"n" => 3}) == {:ok, false}
-      assert Expression.eval("n > 3", %{"n" => 3}) == {:ok, false}
+    test "paths use string keys only" do
+      assert Expression.eval("value", %{value: 42}) == {:ok, nil}
+      assert Expression.eval("nested.value", %{"nested" => %{value: 42}}) == {:ok, nil}
     end
 
-    test "ints and floats compare across types" do
-      assert Expression.eval("n >= 2.5", %{"n" => 3}) == {:ok, true}
+    test "dotted paths walk nested maps" do
+      assert Expression.eval("user.profile.age", %{
+               "user" => %{"profile" => %{"age" => 21}}
+             }) == {:ok, 21}
     end
 
-    test "equality is structural and type-aware across any value" do
-      assert Expression.eval(~s(name == "Ada"), %{"name" => "Ada"}) == {:ok, true}
-      assert Expression.eval("flag != true", %{"flag" => false}) == {:ok, true}
-      # A number and its string form are not equal — no coercion.
-      assert Expression.eval(~s(n == "5"), %{"n" => 5}) == {:ok, false}
+    test "missing, non-map, and explicitly nil paths all resolve to nil" do
+      assert Expression.eval("user.age", %{}) == {:ok, nil}
+      assert Expression.eval("user.age", %{"user" => "not a map"}) == {:ok, nil}
+      assert Expression.eval("user.age", %{"user" => %{"age" => nil}}) == {:ok, nil}
     end
 
-    test "Elixir numeric equality treats equivalent integers and floats as equal" do
-      assert Expression.eval("1 == 1.0", %{}) == {:ok, true}
-    end
+    test "identifiers accept underscores and trailing digits without consuming keyword prefixes" do
+      bindings = %{"_private2" => 2, "true_value1" => 1, "nil_value" => nil}
 
-    test "ordering a non-number is a type error, not a crash" do
-      assert {:error, {:not_comparable, :gt, "Ada", 5}} =
-               Expression.eval("name > 5", %{"name" => "Ada"})
+      assert Expression.eval("_private2 == 2", bindings) == {:ok, true}
+      assert Expression.eval("true_value1 == 1", bindings) == {:ok, true}
+      assert Expression.eval("nil_value == null", bindings) == {:ok, true}
     end
   end
 
-  describe "literals" do
-    test "string literals accept single or double quotes" do
-      assert Expression.eval(~s(x == 'hi'), %{"x" => "hi"}) == {:ok, true}
-      assert Expression.eval(~s(x == "hi"), %{"x" => "hi"}) == {:ok, true}
+  describe "literals and equality" do
+    test "number, boolean, null, and nil literals retain their native values" do
+      assert Expression.eval("12", %{}) == {:ok, 12}
+      assert Expression.eval("12.5", %{}) == {:ok, 12.5}
+      assert Expression.eval("true", %{}) == {:ok, true}
+      assert Expression.eval("false", %{}) == {:ok, false}
+      assert Expression.eval("null", %{}) == {:ok, nil}
+      assert Expression.eval("nil", %{}) == {:ok, nil}
+    end
+
+    test "single and double quoted strings support escaped delimiters" do
+      assert Expression.eval(~S("double \" quote"), %{}) == {:ok, ~s(double " quote)}
+      assert Expression.eval(~S('single \' quote'), %{}) == {:ok, "single ' quote"}
+    end
+
+    test "string literals preserve Unicode" do
+      assert Expression.eval(~s("héllo 世界"), %{}) == {:ok, "héllo 世界"}
     end
 
     test "backslash escapes the next character without interpreting escape sequences" do
-      assert Expression.eval(~S(value == "a\nb"), %{"value" => "anb"}) == {:ok, true}
-      assert Expression.eval(~S(value == "a\nb"), %{"value" => "a\nb"}) == {:ok, false}
+      assert Expression.eval(~S("a\nb"), %{}) == {:ok, "anb"}
+      assert Expression.eval(~S("a\\b"), %{}) == {:ok, "a\\b"}
     end
 
-    test "null compares equal to a missing field — presence testing" do
-      assert Expression.eval("x == null", %{}) == {:ok, true}
-      assert Expression.eval("x != null", %{"x" => 1}) == {:ok, true}
-    end
-
-    test "nil is an alias for null" do
-      assert Expression.eval("x == nil", %{}) == {:ok, true}
-      assert Expression.eval("nil == null", %{}) == {:ok, true}
+    test "equality uses Elixir semantics without coercion" do
+      assert Expression.eval("1 == 1.0", %{}) == {:ok, true}
+      assert Expression.eval(~s(value == "5"), %{"value" => 5}) == {:ok, false}
+      assert Expression.eval("left != right", %{"left" => :a, "right" => :b}) == {:ok, true}
     end
   end
 
-  describe "boolean logic" do
-    test "&& and || combine comparisons" do
-      bindings = %{"count" => 10, "kind" => "webhook"}
-      assert Expression.eval(~s(count > 5 && kind == "webhook"), bindings) == {:ok, true}
-      assert Expression.eval(~s(count > 50 || kind == "webhook"), bindings) == {:ok, true}
-      assert Expression.eval(~s(count > 50 && kind == "webhook"), bindings) == {:ok, false}
+  describe "operators and precedence" do
+    test "every comparison operator evaluates numbers" do
+      cases = [
+        {"value < 5", 4, true},
+        {"value > 5", 4, false},
+        {"value <= 5", 5, true},
+        {"value >= 5", 5, true},
+        {"value == 5", 5, true},
+        {"value != 5", 5, false}
+      ]
+
+      for {source, value, expected} <- cases do
+        assert Expression.eval(source, %{"value" => value}) == {:ok, expected}
+      end
     end
 
-    test "! negates a boolean" do
-      assert Expression.eval("!active", %{"active" => false}) == {:ok, true}
+    test "ordering compares integers and floats" do
+      assert Expression.eval("value >= 2.5", %{"value" => 3}) == {:ok, true}
+      assert Expression.eval("value < 3", %{"value" => 2.5}) == {:ok, true}
     end
 
-    test "&& and || short-circuit before evaluating the right operand" do
+    test "precedence is unary, ordering, equality, and, then or" do
+      assert Expression.eval("!true == false", %{}) == {:ok, true}
+      assert Expression.eval("1 < 2 == true", %{}) == {:ok, true}
+      assert Expression.eval("true == true && false", %{}) == {:ok, false}
+      assert Expression.eval("false && true || true", %{}) == {:ok, true}
+    end
+
+    test "parentheses override precedence" do
+      bindings = %{"a" => false, "b" => true, "c" => false}
+
+      assert Expression.eval("a || b && c", bindings) == {:ok, false}
+      assert Expression.eval("(a || b) && c", bindings) == {:ok, false}
+      assert Expression.eval("a || (b && !c)", bindings) == {:ok, true}
+    end
+
+    test "unary not can repeat" do
+      assert Expression.eval("!!true", %{}) == {:ok, true}
+      assert Expression.eval("!!!false", %{}) == {:ok, true}
+    end
+
+    test "boolean operators short-circuit" do
       assert Expression.eval("false && value", %{"value" => 5}) == {:ok, false}
       assert Expression.eval("true || value", %{"value" => 5}) == {:ok, true}
     end
 
-    test "&& binds tighter than ||" do
-      # false || (true && false) -> false ; not (false || true) && false
-      assert Expression.eval("a || b && c", %{"a" => false, "b" => true, "c" => false}) ==
-               {:ok, false}
+    test "required boolean operands return exact type errors" do
+      assert Expression.eval("1 && true", %{}) == {:error, {:not_boolean, 1}}
+      assert Expression.eval("true && 1", %{}) == {:error, {:not_boolean, 1}}
+      assert Expression.eval("false || 1", %{}) == {:error, {:not_boolean, 1}}
+      assert Expression.eval("!1", %{}) == {:error, {:not_boolean, 1}}
     end
 
-    test "parentheses override precedence" do
-      assert Expression.eval("(a || b) && c", %{"a" => false, "b" => true, "c" => false}) ==
-               {:ok, false}
-
-      assert Expression.eval("(a || b) && c", %{"a" => false, "b" => true, "c" => true}) ==
-               {:ok, true}
-    end
-
-    test "boolean logic on a non-boolean is a type error" do
-      assert {:error, {:not_boolean, 5}} = Expression.eval("n && true", %{"n" => 5})
+    test "space, tab, newline, and carriage return are whitespace" do
+      assert Expression.eval(" \ttrue\n&&\r!false ", %{}) == {:ok, true}
     end
   end
 
-  describe "field access" do
-    test "a dotted path walks into nested maps" do
-      assert Expression.eval("user.age >= 18", %{"user" => %{"age" => 21}}) == {:ok, true}
+  describe "ordering type errors" do
+    test "every nonnumeric value category is rejected" do
+      values = ["text", true, nil, %{}, [], {:tuple, 1}, :atom]
+
+      for value <- values do
+        assert Expression.eval("value < 1", %{"value" => value}) ==
+                 {:error, {:not_comparable, :lt, value, 1}}
+      end
     end
 
-    test "a path through a missing or non-map node resolves to nil" do
-      assert Expression.eval("user.age == null", %{"user" => nil}) == {:ok, true}
-      assert Expression.eval("a.b.c == null", %{}) == {:ok, true}
-    end
+    test "the error identifies each ordering operator and both operands" do
+      cases = [
+        {"left < right", :lt},
+        {"left > right", :gt},
+        {"left <= right", :lte},
+        {"left >= right", :gte}
+      ]
 
-    test "a bare boolean field is a valid predicate" do
-      assert Expression.eval("active", %{"active" => true}) == {:ok, true}
+      for {source, operator} <- cases do
+        assert Expression.eval(source, %{"left" => 1, "right" => "two"}) ==
+                 {:error, {:not_comparable, operator, 1, "two"}}
+      end
     end
   end
 
-  describe "malformed input returns an error" do
-    test "an empty expression" do
-      assert {:error, _} = Expression.eval("", %{})
+  describe "malformed input" do
+    test "empty and dangling expressions return unexpected end" do
+      for source <- ["", "!", "1 ==", "true &&", "false ||", "("] do
+        assert Expression.eval(source, %{}) == {:error, :unexpected_end}
+      end
     end
 
-    test "a dangling operator" do
-      assert {:error, _} = Expression.eval("count >", %{"count" => 1})
+    test "unexpected primary and leftover tokens return a normalized error" do
+      assert Expression.eval(")", %{}) == {:error, :unexpected_token}
+      assert Expression.eval("true)", %{}) == {:error, :unexpected_token}
+      assert Expression.eval("a == 1 b", %{"a" => 1}) == {:error, :unexpected_token}
     end
 
-    test "an unclosed parenthesis" do
-      assert {:error, _} = Expression.eval("(a == 1", %{"a" => 1})
+    test "unclosed parentheses return the documented error" do
+      assert Expression.eval("(a == 1", %{"a" => 1}) ==
+               {:error, :missing_closing_parenthesis}
     end
 
-    test "leftover tokens after a complete expression" do
-      assert {:error, {:unexpected_tokens, [{:ident, "b"}]}} =
-               Expression.eval("a == 1 b", %{"a" => 1})
+    test "unknown and malformed one-character operators identify the character" do
+      for {source, character} <- [
+            {"a @ 1", "@"},
+            {"-1", "-"},
+            {"a = 1", "="},
+            {"true & false", "&"},
+            {"true | false", "|"}
+          ] do
+        assert Expression.eval(source, %{"a" => 1}) ==
+                 {:error, {:unexpected_character, character}}
+      end
     end
 
-    test "an unknown character" do
-      assert {:error, _} = Expression.eval("a @ 1", %{"a" => 1})
-    end
-
-    test "a negative numeric literal is rejected as an unexpected character" do
-      assert Expression.eval("-1", %{}) == {:error, {:unexpected_char, "-"}}
-    end
-
-    test "an unclosed string is rejected" do
+    test "unclosed strings return the documented error" do
       assert Expression.eval(~S("unfinished), %{}) == {:error, :unterminated_string}
+      assert Expression.eval(~S('unfinished), %{}) == {:error, :unterminated_string}
     end
 
-    test "a malformed numeric literal is rejected" do
-      assert Expression.eval("1.2.3", %{}) == {:error, {:bad_number, "1.2.3"}}
+    test "repeated decimal points return the malformed number" do
+      assert Expression.eval("1.2.3", %{}) == {:error, {:invalid_number, "1.2.3"}}
+      assert Expression.eval("1..2", %{}) == {:error, {:invalid_number, "1..2"}}
     end
 
-    test "a path cannot end with a dot" do
+    test "a path cannot end with a dot or contain an empty segment" do
       assert Expression.eval("a.", %{}) == {:error, :trailing_dot}
+      assert Expression.eval("a..b", %{}) == {:error, :trailing_dot}
+    end
+
+    test "invalid UTF-8 is always normalized" do
+      assert Expression.eval(<<255>>, %{}) == {:error, :invalid_utf8}
+      assert Expression.eval(<<"name", 255>>, %{}) == {:error, :invalid_utf8}
+      assert Expression.eval(<<"\"", 255>>, %{}) == {:error, :invalid_utf8}
+      assert Expression.eval(<<"\"\\", 255>>, %{}) == {:error, :invalid_utf8}
     end
   end
 
-  describe "argument contract" do
-    test "invalid source and bindings types raise FunctionClauseError" do
+  describe "argument and safety contract" do
+    test "invalid argument types raise FunctionClauseError" do
       assert_raise FunctionClauseError, fn -> Expression.eval(:not_binary, %{}) end
       assert_raise FunctionClauseError, fn -> Expression.eval("true", []) end
     end
-  end
 
-  describe "no arbitrary code — the language has no escape hatch" do
-    test "function-call syntax does not evaluate; it is just unparseable text" do
-      assert {:error, _} = Expression.eval("System.halt(1)", %{})
-      assert {:error, _} = Expression.eval(~S|File.read!("/etc/passwd")|, %{})
+    test "function-call syntax is not executable" do
+      assert Expression.eval("System.halt(1)", %{}) == {:error, :unexpected_token}
+      assert Expression.eval(~S|File.read!("/etc/passwd")|, %{}) == {:error, :unexpected_token}
     end
   end
+
+  property "arbitrary binaries never raise or escape the documented result contract" do
+    check all(source <- binary(), max_runs: 500) do
+      case Expression.eval(source, %{}) do
+        {:ok, _value} ->
+          :ok
+
+        {:error, reason} ->
+          assert documented_reason?(reason)
+      end
+    end
+  end
+
+  property "non-negative integer ordering agrees with Elixir" do
+    check all(
+            left <- integer(0..1_000_000),
+            right <- integer(0..1_000_000)
+          ) do
+      assert Expression.eval("value < #{right}", %{"value" => left}) == {:ok, left < right}
+    end
+  end
+
+  defp documented_reason?(reason)
+       when reason in [
+              :invalid_utf8,
+              :unterminated_string,
+              :unexpected_end,
+              :missing_closing_parenthesis,
+              :trailing_dot,
+              :unexpected_token
+            ],
+       do: true
+
+  defp documented_reason?({:unexpected_character, character}), do: is_binary(character)
+  defp documented_reason?({:invalid_number, number}), do: is_binary(number)
+  defp documented_reason?({:not_boolean, _value}), do: true
+
+  defp documented_reason?({:not_comparable, operator, _left, _right}),
+    do: operator in [:lt, :gt, :lte, :gte]
+
+  defp documented_reason?(_reason), do: false
 end
