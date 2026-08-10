@@ -217,8 +217,9 @@ defmodule SafeExpressionTest do
 
   describe "argument and safety contract" do
     test "invalid argument types raise FunctionClauseError" do
-      assert_raise FunctionClauseError, fn -> apply(Expression, :eval, [:not_binary, %{}]) end
-      assert_raise FunctionClauseError, fn -> apply(Expression, :eval, ["true", []]) end
+      expression = Module.concat([Expression])
+      assert_raise FunctionClauseError, fn -> expression.eval(:not_binary, %{}) end
+      assert_raise FunctionClauseError, fn -> expression.eval("true", []) end
     end
 
     test "function-call syntax is not executable" do
