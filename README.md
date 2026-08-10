@@ -109,6 +109,16 @@ When `source` is a binary and `bindings` is a map, malformed expressions and ope
 
 `character` and the `source` value in `{:invalid_number, source}` are binaries. `operator` is one of `:lt`, `:gt`, `:lte`, or `:gte`. `eval/2` raises `FunctionClauseError` when `source` is not a binary or `bindings` is not a map.
 
+## Releasing
+
+Configure the repository's `HEX_API_KEY` Actions secret once. For each release, start from a clean `main` branch that matches `origin/main`, then run:
+
+```shell
+./scripts/release.exs VERSION
+```
+
+For example, `./scripts/release.exs 0.2.0` updates the package and README versions, creates the `Release v0.2.0` commit and annotated tag, and atomically pushes both. The tag-triggered CI workflow publishes the package and documentation after all checks pass. If an atomic push fails, fix the reported problem and rerun the same command to resume it.
+
 ## License
 
 SafeExpression uses the [MIT License](https://github.com/logandonley/safe_expression/blob/main/LICENSE).
